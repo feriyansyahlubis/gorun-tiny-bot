@@ -8,8 +8,16 @@
 //   BUY  20% of equity when RSI(14) <= 30 (a sharp hourly sell-off), or when
 //        RSI(14) <= 35 while the close sits >= 4% below its 48-hour SMA
 //        (a deep dip that has not quite reached RSI 30).
-//   SELL the whole position when RSI(14) >= 50 (the bounce has run its
-//        course), or at -4% (stop-loss), or at +6% (take-profit).
+//   SELL in two stages once the bounce starts: half the position when
+//        RSI(14) >= 50 (bank the first recovery), the rest when RSI(14)
+//        reaches 55 (a stronger recovery) — or at -4% (stop-loss), or at
+//        +6% (take-profit), whichever comes first. Splitting the exit
+//        banks half the bounce while letting the other half ride, and it
+//        also turns each round trip into three fills instead of two, which
+//        matters in a 72-bar final window where the 8-trade minimum is the
+//        binding risk: the dev window's trades cluster into two sell-off
+//        episodes, so a quiet final window may only offer a handful of
+//        entries, and every position should count for more than one fill.
 //
 // Why this shape: the dev window falls ~9% across the board, so buy-and-hold
 // loses ~$869; a bot that only buys genuinely oversold hours and exits on
@@ -63,7 +71,8 @@ const RSI_BUY = 30; // sharp oversold
 const RSI_DIP = 35; // deep-dip second trigger
 const DIP_BELOW_SMA48_PCT = 0.04;
 const SMA_PERIOD = 48;
-const RSI_SELL = 50; // bounce exhausted
+const RSI_SELL = 50; // first half out: bounce under way
+const RSI_SELL_REST = 55; // rest out: stronger recovery
 const STOP_PCT = 0.04; // stop-loss vs entry
 const TAKE_PROFIT_PCT = 0.06;
 const SIZE_BPS = 2000; // 20% of equity per new position
@@ -73,6 +82,11 @@ const MIN_NOTIONAL = 1_000_000n; // 1 USDC, the harness minimum
 // --- bot --------------------------------------------------------------------
 
 const closes = new Map<string, number[]>();
+// Symbols whose position already sold its first half (tiered exit state).
+// The harness cuts a position's cost basis proportionally on a partial
+// sell, so the entry price recomputed from cost/qty below stays valid
+// after the first half is out.
+const scaledOut = new Set<string>();
 
 await runBars({
   onBatch(state) {
@@ -116,8 +130,18 @@ await runBars({
           (Number(held.cost) * 10 ** sym.qty_scale) /
           (Number(held.qty) * 10 ** state.hello.capital.quote_scale);
         const change = price / entry - 1;
-        if (rsiNow >= RSI_SELL || change <= -STOP_PCT || change >= TAKE_PROFIT_PCT) {
+        if (change <= -STOP_PCT || change >= TAKE_PROFIT_PCT) {
+          // Stop-loss or take-profit: out in full.
           orders.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
+          scaledOut.delete(symbol);
+        } else if (!scaledOut.has(symbol) && rsiNow >= RSI_SELL) {
+          // First half out on the first sign of recovery.
+          orders.push({ side: 'sell', symbol, qty: held.qty / 2n, max_slippage_bps: MAX_SLIPPAGE_BPS });
+          scaledOut.add(symbol);
+        } else if (scaledOut.has(symbol) && rsiNow >= RSI_SELL_REST) {
+          // Rest out once the recovery strengthens.
+          orders.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
+          scaledOut.delete(symbol);
         }
         continue;
       }
